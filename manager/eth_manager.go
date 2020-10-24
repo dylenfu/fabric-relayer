@@ -101,37 +101,67 @@ type EthereumManager struct {
 	db             *db.BoltDB
 }
 
-func NewEthereumManager(servconfig *config.ServiceConfig, startheight uint64, startforceheight uint64, ontsdk *sdk.PolySdk, client *ethclient.Client, boltDB *db.BoltDB) (*EthereumManager, error) {
-	var wallet *sdk.Wallet
-	var err error
-	if !common.FileExisted(servconfig.PolyConfig.WalletFile) {
-		wallet, err = ontsdk.CreateWallet(servconfig.PolyConfig.WalletFile)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		wallet, err = ontsdk.OpenWallet(servconfig.PolyConfig.WalletFile)
-		if err != nil {
-			log.Errorf("NewETHManager - wallet open error: %s", err.Error())
-			return nil, err
-		}
+func (e *EthereumManager) init() error {
+	latestHeight := e.findLatestHeight()
+	if latestHeight == 0 {
+		return fmt.Errorf("init - the genesis block has not synced!")
 	}
-	signer, err := wallet.GetDefaultAccount([]byte(servconfig.PolyConfig.WalletPwd))
-	if err != nil || signer == nil {
-		signer, err = wallet.NewDefaultSettingAccount([]byte(servconfig.PolyConfig.WalletPwd))
-		if err != nil {
-			log.Errorf("NewETHManager - wallet password error")
-			return nil, err
-		}
 
-		err = wallet.Save()
-		if err != nil {
-			return nil, err
-		}
+	if e.forceHeight > 0 && e.forceHeight < latestHeight {
+		e.currentHeight = e.forceHeight
+	} else {
+		e.currentHeight = latestHeight
 	}
+
+	log.Infof("EthereumManager init - start height: %d", e.currentHeight)
+	return nil
+}
+
+func NewEthereumManager(
+	servconfig *config.ServiceConfig,
+	startheight,
+	startforceheight uint64,
+	ontsdk *sdk.PolySdk,
+	client *ethclient.Client,
+	boltDB *db.BoltDB,
+) (mgr *EthereumManager, err error) {
+
+	var (
+		wallet *sdk.Wallet
+		signer *sdk.Account
+
+		wf  = servconfig.PolyConfig.WalletFile
+		pwd = []byte(servconfig.PolyConfig.WalletPwd)
+	)
+
+	// open wallet with poly sdk
+	if !common.FileExisted(wf) {
+		wallet, err = ontsdk.CreateWallet(wf)
+	} else {
+		wallet, err = ontsdk.OpenWallet(wf)
+	}
+	if err != nil {
+		log.Errorf("NewETHManager - wallet open error: %s", err.Error())
+		return
+	}
+
+	// get account
+	if signer, err = wallet.GetDefaultAccount(pwd); err != nil || signer == nil {
+		signer, err = wallet.NewDefaultSettingAccount(pwd)
+	}
+	if err != nil {
+		log.Errorf("NewETHManager - wallet password error")
+		return nil, err
+	}
+
+	// save wallet
+	if err = wallet.Save(); err != nil {
+		return
+	}
+
 	log.Infof("NewETHManager - poly address: %s", signer.Address.ToBase58())
 
-	mgr := &EthereumManager{
+	mgr = &EthereumManager{
 		config:        servconfig,
 		exitChan:      make(chan int),
 		currentHeight: startheight,
@@ -144,97 +174,87 @@ func NewEthereumManager(servconfig *config.ServiceConfig, startheight uint64, st
 		crosstx4sync:  make([]*CrossTransfer, 0),
 		db:            boltDB,
 	}
-	err = mgr.init()
-	if err != nil {
+
+	if err = mgr.init(); err != nil {
 		return nil, err
-	} else {
-		return mgr, nil
 	}
+	return
 }
 
-func (this *EthereumManager) MonitorChain() {
-	fetchBlockTicker := time.NewTicker(config.ETH_MONITOR_INTERVAL)
-	var blockHandleResult bool
-	backtrace := uint64(1)
+func (e *EthereumManager) MonitorChain() {
+
+	var (
+		blockHandleResult bool
+		backtrace         = uint64(1)
+		fetchBlockTicker  = time.NewTicker(config.ETH_MONITOR_INTERVAL)
+	)
+
 	for {
 		select {
 		case <-fetchBlockTicker.C:
-			height, err := tools.GetNodeHeight(this.config.ETHConfig.RestURL, this.restClient)
+			height, err := tools.GetNodeHeight(e.config.ETHConfig.RestURL, e.restClient)
 			if err != nil {
 				log.Infof("MonitorChain - cannot get node height, err: %s", err)
 				continue
 			}
-			if height-this.currentHeight <= config.ETH_USEFUL_BLOCK_NUM {
+			if height-e.currentHeight <= config.ETH_USEFUL_BLOCK_NUM {
 				continue
 			}
 			log.Infof("MonitorChain - eth height is %d", height)
 			blockHandleResult = true
-			for this.currentHeight < height-config.ETH_USEFUL_BLOCK_NUM {
-				blockHandleResult = this.handleNewBlock(this.currentHeight + 1)
+			for e.currentHeight < height-config.ETH_USEFUL_BLOCK_NUM {
+				blockHandleResult = e.handleNewBlock(e.currentHeight + 1)
 				if blockHandleResult == false {
 					break
 				}
-				this.currentHeight++
+				e.currentHeight++
 				// try to commit header if more than 50 headers needed to be syned
-				if len(this.header4sync) >= this.config.ETHConfig.HeadersPerBatch {
-					if this.commitHeader() != 0 {
+				if len(e.header4sync) >= e.config.ETHConfig.HeadersPerBatch {
+					if e.commitHeader() != 0 {
 						log.Errorf("MonitorChain - commit header failed.")
 						blockHandleResult = false
 						break
 					}
-					this.header4sync = make([][]byte, 0)
+					e.header4sync = make([][]byte, 0)
 				}
 			}
 			if blockHandleResult == false {
 				continue
 			}
 			// try to commit lastest header when we are at latest height
-			commitHeaderResult := this.commitHeader()
+			commitHeaderResult := e.commitHeader()
 			if commitHeaderResult > 0 {
 				log.Errorf("MonitorChain - commit header failed.")
 				continue
 			} else if commitHeaderResult == 0 {
 				backtrace = 1
-				this.header4sync = make([][]byte, 0)
+				e.header4sync = make([][]byte, 0)
 				continue
 			} else {
-				latestHeight := this.findLastestHeight()
+				latestHeight := e.findLatestHeight()
 				if latestHeight == 0 {
 					continue
 				}
-				this.currentHeight = latestHeight - backtrace
+				e.currentHeight = latestHeight - backtrace
 				backtrace++
-				log.Errorf("MonitorChain - back to height: %d", this.currentHeight)
-				this.header4sync = make([][]byte, 0)
+				log.Errorf("MonitorChain - back to height: %d", e.currentHeight)
+				e.header4sync = make([][]byte, 0)
 			}
-		case <-this.exitChan:
+		case <-e.exitChan:
 			return
 		}
 	}
 }
-func (this *EthereumManager) init() error {
-	// get latest height
-	latestHeight := this.findLastestHeight()
-	if latestHeight == 0 {
-		return fmt.Errorf("init - the genesis block has not synced!")
-	}
-	if this.forceHeight > 0 && this.forceHeight < latestHeight {
-		this.currentHeight = this.forceHeight
-	} else {
-		this.currentHeight = latestHeight
-	}
-	log.Infof("EthereumManager init - start height: %d", this.currentHeight)
-	return nil
-}
 
-func (this *EthereumManager) findLastestHeight() uint64 {
+func (e *EthereumManager) findLatestHeight() uint64 {
 	// try to get key
 	var sideChainIdBytes [8]byte
-	binary.LittleEndian.PutUint64(sideChainIdBytes[:], this.config.ETHConfig.SideChainId)
+	binary.LittleEndian.PutUint64(sideChainIdBytes[:], e.config.ETHConfig.SideChainId)
 	contractAddress := autils.HeaderSyncContractAddress
 	key := append([]byte(scom.CURRENT_HEADER_HEIGHT), sideChainIdBytes[:]...)
+
 	// try to get storage
-	result, err := this.polySdk.GetStorage(contractAddress.ToHexString(), key)
+	result, err := e.polySdk.GetStorage(contractAddress.ToHexString(), key)
 	if err != nil {
 		return 0
 	}
@@ -245,31 +265,31 @@ func (this *EthereumManager) findLastestHeight() uint64 {
 	}
 }
 
-func (this *EthereumManager) handleNewBlock(height uint64) bool {
-	ret := this.handleBlockHeader(height)
+func (e *EthereumManager) handleNewBlock(height uint64) bool {
+	ret := e.handleBlockHeader(height)
 	if !ret {
 		log.Errorf("handleNewBlock - handleBlockHeader on height :%d failed", height)
 		return false
 	}
-	ret = this.fetchLockDepositEvents(height, this.client)
+	ret = e.fetchLockDepositEvents(height, e.client)
 	if !ret {
 		log.Errorf("handleNewBlock - fetchLockDepositEvents on height :%d failed", height)
 	}
 	return true
 }
 
-func (this *EthereumManager) handleBlockHeader(height uint64) bool {
-	header, err := tools.GetNodeHeader(this.config.ETHConfig.RestURL, this.restClient, height)
+func (e *EthereumManager) handleBlockHeader(height uint64) bool {
+	header, err := tools.GetNodeHeader(e.config.ETHConfig.RestURL, e.restClient, height)
 	if err != nil {
 		log.Errorf("handleBlockHeader - GetNodeHeader on height :%d failed", height)
 		return false
 	}
-	this.header4sync = append(this.header4sync, header)
+	e.header4sync = append(e.header4sync, header)
 	return true
 }
 
-func (this *EthereumManager) fetchLockDepositEvents(height uint64, client *ethclient.Client) bool {
-	lockAddress := ethcommon.HexToAddress(this.config.ETHConfig.ECCMContractAddress)
+func (e *EthereumManager) fetchLockDepositEvents(height uint64, client *ethclient.Client) bool {
+	lockAddress := ethcommon.HexToAddress(e.config.ETHConfig.ECCMContractAddress)
 	lockContract, err := eccm_abi.NewEthCrossChainManager(lockAddress, client)
 	if err != nil {
 		return false
@@ -292,9 +312,9 @@ func (this *EthereumManager) fetchLockDepositEvents(height uint64, client *ethcl
 	for events.Next() {
 		evt := events.Event
 		var isTarget bool
-		if len(this.config.TargetContracts) > 0 {
+		if len(e.config.TargetContracts) > 0 {
 			toContractStr := evt.ProxyOrAssetContract.String()
-			for _, v := range this.config.TargetContracts {
+			for _, v := range e.config.TargetContracts {
 				toChainIdArr, ok := v[toContractStr]
 				if ok {
 					if len(toChainIdArr["outbound"]) == 0 {
@@ -327,21 +347,21 @@ func (this *EthereumManager) fetchLockDepositEvents(height uint64, client *ethcl
 		}
 		sink := common.NewZeroCopySink(nil)
 		crossTx.Serialization(sink)
-		err = this.db.PutRetry(sink.Bytes())
+		err = e.db.PutRetry(sink.Bytes())
 		if err != nil {
-			log.Errorf("fetchLockDepositEvents - this.db.PutRetry error: %s", err)
+			log.Errorf("fetchLockDepositEvents - e.db.PutRetry error: %s", err)
 		}
 		log.Infof("fetchLockDepositEvent -  height: %d", height)
 	}
 	return true
 }
 
-func (this *EthereumManager) commitHeader() int {
-	tx, err := this.polySdk.Native.Hs.SyncBlockHeader(
-		this.config.ETHConfig.SideChainId,
-		this.polySigner.Address,
-		this.header4sync,
-		this.polySigner,
+func (e *EthereumManager) commitHeader() int {
+	tx, err := e.polySdk.Native.Hs.SyncBlockHeader(
+		e.config.ETHConfig.SideChainId,
+		e.polySigner.Address,
+		e.header4sync,
+		e.polySigner,
 	)
 	if err != nil {
 		log.Warnf("commitHeader - send transaction to poly chain err: %s!", err.Error())
@@ -355,8 +375,8 @@ func (this *EthereumManager) commitHeader() int {
 	tick := time.NewTicker(100 * time.Millisecond)
 	var h uint32
 	for range tick.C {
-		h, _ = this.polySdk.GetBlockHeightByTxHash(tx.ToHexString())
-		curr, _ := this.polySdk.GetCurrentBlockHeight()
+		h, _ = e.polySdk.GetBlockHeightByTxHash(tx.ToHexString())
+		curr, _ := e.polySdk.GetCurrentBlockHeight()
 		if h > 0 && curr > h {
 			break
 		}
@@ -364,30 +384,32 @@ func (this *EthereumManager) commitHeader() int {
 	log.Infof("commitHeader - send transaction %s to poly chain and confirmed on height %d", tx.ToHexString(), h)
 	return 0
 }
-func (this *EthereumManager) MonitorDeposit() {
+
+func (e *EthereumManager) MonitorDeposit() {
 	monitorTicker := time.NewTicker(config.ETH_MONITOR_INTERVAL)
 	for {
 		select {
 		case <-monitorTicker.C:
-			height, err := tools.GetNodeHeight(this.config.ETHConfig.RestURL, this.restClient)
+			height, err := tools.GetNodeHeight(e.config.ETHConfig.RestURL, e.restClient)
 			if err != nil {
 				log.Infof("MonitorChain - cannot get node height, err: %s", err)
 				continue
 			}
-			snycheight := this.findLastestHeight()
+			snycheight := e.findLatestHeight()
 			if snycheight > height-config.ETH_PROOF_USERFUL_BLOCK {
 				// try to handle deposit event when we are at latest height
-				this.handleLockDepositEvents(snycheight)
+				e.handleLockDepositEvents(snycheight)
 			}
-		case <-this.exitChan:
+		case <-e.exitChan:
 			return
 		}
 	}
 }
-func (this *EthereumManager) handleLockDepositEvents(refHeight uint64) error {
-	retryList, err := this.db.GetAllRetry()
+
+func (e *EthereumManager) handleLockDepositEvents(refHeight uint64) error {
+	retryList, err := e.db.GetAllRetry()
 	if err != nil {
-		return fmt.Errorf("handleLockDepositEvents - this.db.GetAllRetry error: %s", err)
+		return fmt.Errorf("handleLockDepositEvents - e.db.GetAllRetry error: %s", err)
 	}
 	for _, v := range retryList {
 		time.Sleep(time.Second * 1)
@@ -404,27 +426,27 @@ func (this *EthereumManager) handleLockDepositEvents(refHeight uint64) error {
 			log.Errorf("handleLockDepositEvents - MappingKeyAt error:%s\n", err.Error())
 			continue
 		}
-		if refHeight <= crosstx.height+this.config.ETHConfig.BlockConfig {
+		if refHeight <= crosstx.height+e.config.ETHConfig.BlockConfig {
 			continue
 		}
-		height := int64(refHeight - this.config.ETHConfig.BlockConfig)
+		height := int64(refHeight - e.config.ETHConfig.BlockConfig)
 		heightHex := hexutil.EncodeBig(big.NewInt(height))
 		proofKey := hexutil.Encode(keyBytes)
 		//2. get proof
-		proof, err := tools.GetProof(this.config.ETHConfig.RestURL, this.config.ETHConfig.ECCDContractAddress, proofKey, heightHex, this.restClient)
+		proof, err := tools.GetProof(e.config.ETHConfig.RestURL, e.config.ETHConfig.ECCDContractAddress, proofKey, heightHex, e.restClient)
 		if err != nil {
 			log.Errorf("handleLockDepositEvents - error :%s\n", err.Error())
 			continue
 		}
 		//3. commit proof to poly
-		txHash, err := this.commitProof(uint32(height), proof, crosstx.value, crosstx.txId)
+		txHash, err := e.commitProof(uint32(height), proof, crosstx.value, crosstx.txId)
 		if err != nil {
 			if strings.Contains(err.Error(), "chooseUtxos, current utxo is not enough") {
 				log.Infof("handleLockDepositEvents - invokeNativeContract error: %s", err)
 				continue
 			} else {
-				if err := this.db.DeleteRetry(v); err != nil {
-					log.Errorf("handleLockDepositEvents - this.db.DeleteRetry error: %s", err)
+				if err := e.db.DeleteRetry(v); err != nil {
+					log.Errorf("handleLockDepositEvents - e.db.DeleteRetry error: %s", err)
 				}
 				if strings.Contains(err.Error(), "tx already done") {
 					log.Debugf("handleLockDepositEvents - eth_tx %s already on poly", ethcommon.BytesToHash(crosstx.txId).String())
@@ -435,29 +457,29 @@ func (this *EthereumManager) handleLockDepositEvents(refHeight uint64) error {
 			}
 		}
 		//4. put to check db for checking
-		err = this.db.PutCheck(txHash, v)
+		err = e.db.PutCheck(txHash, v)
 		if err != nil {
-			log.Errorf("handleLockDepositEvents - this.db.PutCheck error: %s", err)
+			log.Errorf("handleLockDepositEvents - e.db.PutCheck error: %s", err)
 		}
-		err = this.db.DeleteRetry(v)
+		err = e.db.DeleteRetry(v)
 		if err != nil {
-			log.Errorf("handleLockDepositEvents - this.db.PutCheck error: %s", err)
+			log.Errorf("handleLockDepositEvents - e.db.PutCheck error: %s", err)
 		}
 		log.Infof("handleLockDepositEvents - syncProofToAlia txHash is %s", txHash)
 	}
 	return nil
 }
 
-func (this *EthereumManager) commitProof(height uint32, proof []byte, value []byte, txhash []byte) (string, error) {
+func (e *EthereumManager) commitProof(height uint32, proof []byte, value []byte, txhash []byte) (string, error) {
 	log.Debugf("commit proof, height: %d, proof: %s, value: %s, txhash: %s", height, string(proof), hex.EncodeToString(value), hex.EncodeToString(txhash))
-	tx, err := this.polySdk.Native.Ccm.ImportOuterTransfer(
-		this.config.ETHConfig.SideChainId,
+	tx, err := e.polySdk.Native.Ccm.ImportOuterTransfer(
+		e.config.ETHConfig.SideChainId,
 		value,
 		height,
 		proof,
-		ethcommon.Hex2Bytes(this.polySigner.Address.ToHexString()),
+		ethcommon.Hex2Bytes(e.polySigner.Address.ToHexString()),
 		[]byte{},
-		this.polySigner)
+		e.polySigner)
 	if err != nil {
 		return "", err
 	} else {
@@ -466,7 +488,8 @@ func (this *EthereumManager) commitProof(height uint32, proof []byte, value []by
 		return tx.ToHexString(), nil
 	}
 }
-func (this *EthereumManager) parserValue(value []byte) []byte {
+
+func (e *EthereumManager) parserValue(value []byte) []byte {
 	source := common.NewZeroCopySource(value)
 	txHash, eof := source.NextVarBytes()
 	if eof {
@@ -474,27 +497,29 @@ func (this *EthereumManager) parserValue(value []byte) []byte {
 	}
 	return txHash
 }
-func (this *EthereumManager) CheckDeposit() {
+
+func (e *EthereumManager) CheckDeposit() {
 	checkTicker := time.NewTicker(config.ETH_MONITOR_INTERVAL)
 	for {
 		select {
 		case <-checkTicker.C:
 			// try to check deposit
-			this.checkLockDepositEvents()
-		case <-this.exitChan:
+			e.checkLockDepositEvents()
+		case <-e.exitChan:
 			return
 		}
 	}
 }
-func (this *EthereumManager) checkLockDepositEvents() error {
-	checkMap, err := this.db.GetAllCheck()
+
+func (e *EthereumManager) checkLockDepositEvents() error {
+	checkMap, err := e.db.GetAllCheck()
 	if err != nil {
-		return fmt.Errorf("checkLockDepositEvents - this.db.GetAllCheck error: %s", err)
+		return fmt.Errorf("checkLockDepositEvents - e.db.GetAllCheck error: %s", err)
 	}
 	for k, v := range checkMap {
-		event, err := this.polySdk.GetSmartContractEvent(k)
+		event, err := e.polySdk.GetSmartContractEvent(k)
 		if err != nil {
-			log.Errorf("checkLockDepositEvents - this.aliaSdk.GetSmartContractEvent error: %s", err)
+			log.Errorf("checkLockDepositEvents - e.aliaSdk.GetSmartContractEvent error: %s", err)
 			continue
 		}
 		if event == nil {
@@ -502,14 +527,14 @@ func (this *EthereumManager) checkLockDepositEvents() error {
 		}
 		if event.State != 1 {
 			log.Infof("checkLockDepositEvents - state of poly tx %s is not success", k)
-			err := this.db.PutRetry(v)
+			err := e.db.PutRetry(v)
 			if err != nil {
-				log.Errorf("checkLockDepositEvents - this.db.PutRetry error:%s", err)
+				log.Errorf("checkLockDepositEvents - e.db.PutRetry error:%s", err)
 			}
 		}
-		err = this.db.DeleteCheck(k)
+		err = e.db.DeleteCheck(k)
 		if err != nil {
-			log.Errorf("checkLockDepositEvents - this.db.DeleteRetry error:%s", err)
+			log.Errorf("checkLockDepositEvents - e.db.DeleteRetry error:%s", err)
 		}
 	}
 	return nil
