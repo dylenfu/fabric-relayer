@@ -19,7 +19,7 @@ package main
 import (
 	"strings"
 
-	"github.com/polynetwork/fabric_relayer/config"
+	"github.com/polynetwork/fabric-relayer/config"
 	"github.com/urfave/cli"
 )
 

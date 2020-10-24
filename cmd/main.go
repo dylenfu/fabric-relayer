@@ -24,10 +24,10 @@ import (
 	"syscall"
 
 	"github.com/ethereum/go-ethereum/ethclient"
-	"github.com/polynetwork/fabric_relayer/config"
-	"github.com/polynetwork/fabric_relayer/db"
-	"github.com/polynetwork/fabric_relayer/log"
-	"github.com/polynetwork/fabric_relayer/manager"
+	"github.com/polynetwork/fabric-relayer/config"
+	"github.com/polynetwork/fabric-relayer/db"
+	"github.com/polynetwork/fabric-relayer/log"
+	"github.com/polynetwork/fabric-relayer/manager"
 	sdk "github.com/polynetwork/poly-go-sdk"
 	"github.com/urfave/cli"
 )
